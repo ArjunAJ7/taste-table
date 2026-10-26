@@ -1,0 +1,18 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Taste Table - group taste consensus with Qloo</title>
+<style>body{font:16px system-ui;max-width:760px;margin:2rem auto;padding:0 1rem;color:#1b1b1f}input,select,button{font:inherit;padding:.5rem;margin:.2rem 0}button{background:#3b2fd0;color:#fff;border:0;border-radius:6px;padding:.6rem 1rem;cursor:pointer}.p{border:1px solid #ddd;border-radius:8px;padding:.8rem;margin:.6rem 0}.bar{height:8px;background:#e6e6f5;border-radius:4px}.bar i{display:block;height:8px;background:#3b2fd0;border-radius:4px}small{color:#666}img{max-width:90px;float:right;border-radius:6px;margin-left:8px}</style>
+<h1>Taste Table</h1>
+<p>Everyone lists a few favorite artists. Qloo's taste graph finds places, films or music the <b>whole group</b> will like, ranked so the least-happy person is looked after first.</p>
+<label>Find: <select id="goal"><option value="movie">Movies</option><option value="place">Places</option><option value="artist">Music artists</option><option value="tv_show">TV shows</option><option value="destination">Destinations</option></select></label>
+<label>City (for places, optional): <input id="city" placeholder="e.g. Kochi"></label>
+<div id="people"></div><button onclick="addP()">+ Add person</button> <button onclick="go()">Find consensus</button>
+<div id="out"></div><p><small>Only favorite names are sent to Qloo. Results are aggregate affinities, not facts about any person.</small></p>
+<script>
+const ex=[["Alex","Coldplay, Radiohead, Norah Jones"],["Sam","Taylor Swift, Billie Eilish, Coldplay"],["Riya","Arijit Singh, A. R. Rahman, Coldplay"]];
+const esc=s=>String(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function addP(l="",f=""){const d=document.createElement("div");d.className="p";d.innerHTML=`<input class="l" placeholder="Name/label" value="${esc(l)}"><br><input class="f" style="width:95%" placeholder="Favorite artists, comma separated" value="${esc(f)}">`;people.appendChild(d)}
+ex.forEach(e=>addP(...e));
+async function go(){out.textContent="Asking Qloo...";const ps=[...document.querySelectorAll(".p")].map(d=>({label:d.querySelector(".l").value,favorites:d.querySelector(".f").value.split(",").map(s=>s.trim()).filter(Boolean).map(name=>({name,type:"artist"}))}));
+const r=await fetch("/api/plan",{method:"POST",body:JSON.stringify({goal:goal.value,city:city.value,people:ps})});const j=await r.json();if(!r.ok){out.textContent=j.error;return}
+out.innerHTML="<h2>Group picks</h2>"+(j.picks.map(p=>`<div class="p">${p.image?`<img src="${esc(p.image)}" alt="">`:""}<b>${esc(p.name)}</b> <small>liked by ${p.lovedBy}/${ps.length}, least-happy score ${Math.round(p.min*100)}</small><div class="bar"><i style="width:${p.min*100}%"></i></div><small>${esc(p.compromise)}</small><br><small>${esc(p.blurb).slice(0,200)}</small></div>`).join("")||"No overlap found.")+`<small>${esc(j.method)}</small>`}
+</script>
