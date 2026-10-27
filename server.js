@@ -48,6 +48,23 @@ async function recommend(ids, goal, city) {
   }));
 }
 
+// Step 2b (tool call): the top-50 list for one person omits candidates that only other people surfaced.
+// Missing is not low affinity, so ask Qloo for this person's actual affinity for those exact candidates.
+async function rescore(ids, candidateIds, goal, city) {
+  const out = new Map();
+  for (let i = 0; i < candidateIds.length; i += 50) {
+    const j = await qloo("/v2/insights", {
+      "filter.type": `urn:entity:${goal}`,
+      "signal.interests.entities": ids.join(","),
+      "filter.entities": candidateIds.slice(i, i + 50).join(","),
+      "filter.location.query": city,
+      take: 50,
+    });
+    for (const e of entities(j)) out.set(e.entity_id, e.query?.affinity ?? 0);
+  }
+  return out;
+}
+
 // Step 3: maximin consensus. A pick is only as good as the least-happy person's affinity for it.
 function consensus(perPerson, labels) {
   const table = new Map();
@@ -80,9 +97,22 @@ async function plan(body) {
     resolved.push({ label, entities: ents });
     perPerson.push(ents.length ? await recommend(ents.map((e) => e.id), goal, city) : []);
   }
+  // Fill gaps: every candidate gets a real affinity from every person who has resolved favorites.
+  const byId = new Map();
+  perPerson.forEach((l) => l.forEach((e) => { const c = byId.get(e.id); byId.set(e.id, (c || 0) + e.affinity); }));
+  const cand = [...byId.entries()].sort((a, b) => b[1] - a[1]).slice(0, 100).map(([id]) => id);
+  for (let i = 0; i < people.length; i++) {
+    if (!resolved[i].entities.length) continue;
+    const have = new Set(perPerson[i].map((e) => e.id));
+    const missing = cand.filter((id) => !have.has(id));
+    if (!missing.length) continue;
+    const got = await rescore(resolved[i].entities.map((e) => e.id), missing, goal, city);
+    const meta = new Map(perPerson.flat().map((e) => [e.id, e]));
+    for (const id of missing) if (got.has(id)) perPerson[i].push({ ...meta.get(id), affinity: got.get(id) });
+  }
   return {
     goal, city, resolved,
-    method: "Each person's favorites are resolved to Qloo entities, Qloo returns per-person affinities, and picks are ranked maximin (least-happy person first).",
+    method: "Each person's favorites are resolved to Qloo entities, Qloo returns per-person affinities (and re-scores each candidate for everyone it did not surface for), and picks are ranked maximin (least-happy person first).",
     picks: consensus(perPerson, resolved.map((r) => r.label)),
     note: "Qloo results are aggregate cultural affinities, not facts about any individual. Only entity names are sent to Qloo.",
   };
