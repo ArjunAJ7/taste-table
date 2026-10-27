@@ -43,6 +43,23 @@ async function recommend(ids, goal, city) {
   }));
 }
 
+// Step 2b (tool call): the top-50 list for one person omits candidates that only other people surfaced.
+// Missing is not low affinity, so ask Qloo for this person's actual affinity for those exact candidates.
+async function rescore(ids, candidateIds, goal, city) {
+  const out = new Map();
+  for (let i = 0; i < candidateIds.length; i += 50) {
+    const j = await qloo("/v2/insights", {
+      "filter.type": `urn:entity:${goal}`,
+      "signal.interests.entities": ids.join(","),
+      "filter.entities": candidateIds.slice(i, i + 50).join(","),
+      "filter.location.query": city,
+      take: 50,
+    });
+    for (const e of entities(j)) out.set(e.entity_id, e.query?.affinity ?? 0);
+  }
+  return out;
+}
+
 // Step 3: maximin consensus. A pick is only as good as the least-happy person's affinity for it.
 function consensus(perPerson, labels) {
   const table = new Map();
@@ -75,15 +92,28 @@ async function plan(body) {
     resolved.push({ label, entities: ents });
     perPerson.push(ents.length ? await recommend(ents.map((e) => e.id), goal, city) : []);
   }
+  // Fill gaps: every candidate gets a real affinity from every person who has resolved favorites.
+  const byId = new Map();
+  perPerson.forEach((l) => l.forEach((e) => { const c = byId.get(e.id); byId.set(e.id, (c || 0) + e.affinity); }));
+  const cand = [...byId.entries()].sort((a, b) => b[1] - a[1]).slice(0, 100).map(([id]) => id);
+  for (let i = 0; i < people.length; i++) {
+    if (!resolved[i].entities.length) continue;
+    const have = new Set(perPerson[i].map((e) => e.id));
+    const missing = cand.filter((id) => !have.has(id));
+    if (!missing.length) continue;
+    const got = await rescore(resolved[i].entities.map((e) => e.id), missing, goal, city);
+    const meta = new Map(perPerson.flat().map((e) => [e.id, e]));
+    for (const id of missing) if (got.has(id)) perPerson[i].push({ ...meta.get(id), affinity: got.get(id) });
+  }
   return {
     goal, city, resolved,
-    method: "Each person's favorites are resolved to Qloo entities, Qloo returns per-person affinities, and picks are ranked maximin (least-happy person first).",
+    method: "Each person's favorites are resolved to Qloo entities, Qloo returns per-person affinities (and re-scores each candidate for everyone it did not surface for), and picks are ranked maximin (least-happy person first).",
     picks: consensus(perPerson, resolved.map((r) => r.label)),
     note: "Qloo results are aggregate cultural affinities, not facts about any individual. Only entity names are sent to Qloo.",
   };
 }
 
-const HTML = "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Taste Table - group taste consensus with Qloo</title>\n<style>body{font:16px system-ui;max-width:760px;margin:2rem auto;padding:0 1rem;color:#1b1b1f}input,select,button{font:inherit;padding:.5rem;margin:.2rem 0}button{background:#3b2fd0;color:#fff;border:0;border-radius:6px;padding:.6rem 1rem;cursor:pointer}.p{border:1px solid #ddd;border-radius:8px;padding:.8rem;margin:.6rem 0;overflow:hidden}.bar{height:8px;background:#e6e6f5;border-radius:4px}.bar i{display:block;height:8px;background:#3b2fd0;border-radius:4px}small{color:#666}img{max-width:90px;max-height:120px;object-fit:cover;float:right;border-radius:6px;margin-left:8px}</style>\n<h1>Taste Table</h1>\n<p>Everyone lists a few favorite artists. Qloo's taste graph finds places, films or music the <b>whole group</b> will like, ranked so the least-happy person is looked after first.</p>\n<label>Find: <select id=\"goal\"><option value=\"movie\">Movies</option><option value=\"place\">Places</option><option value=\"artist\">Music artists</option><option value=\"tv_show\">TV shows</option><option value=\"destination\">Destinations</option></select></label>\n<label>City (for places, optional): <input id=\"city\" placeholder=\"e.g. Kochi\"></label>\n<div id=\"people\"></div><button onclick=\"addP()\">+ Add person</button> <button onclick=\"go()\">Find consensus</button>\n<div id=\"out\"></div><p><small>Only favorite names are sent to Qloo. Results are aggregate affinities, not facts about any person.</small></p>\n<script>\nconst ex=[[\"Alex\",\"Coldplay, Radiohead, Norah Jones\"],[\"Sam\",\"Taylor Swift, Billie Eilish, Coldplay\"],[\"Riya\",\"Arijit Singh, A. R. Rahman, Coldplay\"]];\nconst esc=s=>String(s||\"\").replace(/[&<>\"]/g,c=>({\"&\":\"&amp;\",\"<\":\"&lt;\",\">\":\"&gt;\",'\"':\"&quot;\"}[c]));\nfunction addP(l=\"\",f=\"\"){const d=document.createElement(\"div\");d.className=\"p\";d.innerHTML=`<input class=\"l\" placeholder=\"Name/label\" value=\"${esc(l)}\"><br><input class=\"f\" style=\"width:95%\" placeholder=\"Favorite artists, comma separated\" value=\"${esc(f)}\">`;people.appendChild(d)}\nex.forEach(e=>addP(...e));\nasync function go(){out.textContent=\"Asking Qloo...\";const ps=[...document.querySelectorAll(\".p\")].map(d=>({label:d.querySelector(\".l\").value,favorites:d.querySelector(\".f\").value.split(\",\").map(s=>s.trim()).filter(Boolean).map(name=>({name,type:\"artist\"}))}));\nconst r=await fetch(\"/api/plan\",{method:\"POST\",body:JSON.stringify({goal:goal.value,city:city.value,people:ps})});const j=await r.json();if(!r.ok){out.textContent=j.error;return}\nout.innerHTML=\"<h2>Group picks</h2>\"+(j.picks.map(p=>`<div class=\"p\">${p.image?`<img src=\"${esc(p.image)}\" alt=\"\">`:\"\"}<b>${esc(p.name)}</b> <small>liked by ${p.lovedBy}/${ps.length}, least-happy score ${Math.round(p.min*100)}</small><div class=\"bar\"><i style=\"width:${p.min*100}%\"></i></div><small>${esc(p.compromise)}</small><br><small>${esc(p.blurb).slice(0,200)}</small></div>`).join(\"\")||\"No overlap found.\")+`<small>${esc(j.method)}</small>`}\n</script>\n";
+const HTML = "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Taste Table - group taste consensus with Qloo</title>\n<style>body{font:16px system-ui;max-width:760px;margin:2rem auto;padding:0 1rem;color:#1b1b1f}input,select,button{font:inherit;padding:.5rem;margin:.2rem 0}button{background:#3b2fd0;color:#fff;border:0;border-radius:6px;padding:.6rem 1rem;cursor:pointer}.p{border:1px solid #ddd;border-radius:8px;padding:.8rem;margin:.6rem 0;overflow:hidden}.bar{height:8px;background:#e6e6f5;border-radius:4px}.bar i{display:block;height:8px;background:#3b2fd0;border-radius:4px}small{color:#666}img{max-width:90px;max-height:120px;object-fit:cover;float:right;border-radius:6px;margin-left:8px}</style>\n<h1>Taste Table</h1>\n<p>Everyone lists a few favorite artists. Qloo's taste graph scores places, films or music for <b>each person</b>, then ranks options so the least-happy person is looked after first.</p>\n<label>Find: <select id=\"goal\"><option value=\"movie\">Movies</option><option value=\"place\">Places</option><option value=\"artist\">Music artists</option><option value=\"tv_show\">TV shows</option><option value=\"destination\">Destinations</option></select></label>\n<label>City (for places, optional): <input id=\"city\" placeholder=\"e.g. Kochi\"></label>\n<div id=\"people\"></div><button onclick=\"addP()\">+ Add person</button> <button onclick=\"go()\">Find consensus</button>\n<div id=\"out\"></div><p><small>Only favorite names are sent to Qloo. Results are aggregate affinities, not facts about any person.</small></p>\n<script>\nconst ex=[[\"Alex\",\"Coldplay, Radiohead, Norah Jones\"],[\"Sam\",\"Taylor Swift, Billie Eilish, Coldplay\"],[\"Riya\",\"Arijit Singh, A. R. Rahman, Coldplay\"]];\nconst esc=s=>String(s||\"\").replace(/[&<>\"]/g,c=>({\"&\":\"&amp;\",\"<\":\"&lt;\",\">\":\"&gt;\",'\"':\"&quot;\"}[c]));\nfunction addP(l=\"\",f=\"\"){const d=document.createElement(\"div\");d.className=\"p\";d.innerHTML=`<input class=\"l\" placeholder=\"Name/label\" value=\"${esc(l)}\"><br><input class=\"f\" style=\"width:95%\" placeholder=\"Favorite artists, comma separated\" value=\"${esc(f)}\">`;people.appendChild(d)}\nex.forEach(e=>addP(...e));\nasync function go(){out.textContent=\"Asking Qloo...\";const ps=[...document.querySelectorAll(\".p\")].map(d=>({label:d.querySelector(\".l\").value,favorites:d.querySelector(\".f\").value.split(\",\").map(s=>s.trim()).filter(Boolean).map(name=>({name,type:\"artist\"}))}));\nconst r=await fetch(\"/api/plan\",{method:\"POST\",body:JSON.stringify({goal:goal.value,city:city.value,people:ps})});const j=await r.json();if(!r.ok){out.textContent=j.error;return}\nout.innerHTML=\"<h2>Group picks</h2>\"+(j.picks.map(p=>`<div class=\"p\">${p.image?`<img src=\"${esc(p.image)}\" alt=\"\">`:\"\"}<b>${esc(p.name)}</b> <small>liked by ${p.lovedBy}/${ps.length}, least-happy score ${Math.round(p.min*100)}</small><div class=\"bar\"><i style=\"width:${p.min*100}%\"></i></div><small>${esc(p.compromise)}</small><br><small>${esc(p.blurb).slice(0,200)}</small></div>`).join(\"\")||\"No overlap found.\")+`<small>${esc(j.method)}</small>`}\n</script>\n";
 
 export default {
   async fetch(req, env) {
