@@ -1,0 +1,1 @@
+{"name":"taste-table","version":"1.0.0","description":"Group taste-consensus agent on Qloo's taste graph","license":"MIT","private":false,"engines":{"node":">=18"},"scripts":{"start":"node server.js"}}
